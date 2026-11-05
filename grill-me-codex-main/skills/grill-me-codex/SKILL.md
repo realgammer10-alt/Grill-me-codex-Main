@@ -12,9 +12,22 @@ Two acts, two different jobs:
 
 You enter at two points only: answering the grill, and signing off the converged plan. Codex is read-only the whole time and never touches a file.
 
+## Progress and status tracking
+
+Report phase changes in chat and append the same status events to `PLAN-REVIEW-LOG.md`, without credentials or other secrets:
+
+- `GRILL: RUNNING` → `GRILL: COMPLETE`
+- `PLAN: DRAFTING` → `PLAN: READY`
+- `CODEX_CLI: CHECKING` → `CODEX_CLI: READY (version)` or `CODEX_CLI: BLOCKED (reason)`
+- `CODEX_REVIEW: NOT_STARTED` → `CODEX_REVIEW: RUNNING (round n/MAX_ROUNDS)` → `APPROVED`, `NEEDS_REVISION`, or `BLOCKED`
+
+Log each round's start and terminal result. A review round is valid only when the command succeeds, round 1 emits a `thread.started` event, the verdict file is present and non-empty, and its last non-empty line is exactly `VERDICT: APPROVED` or `VERDICT: REVISE`. Keep errors visible. On a failed command, missing output, or malformed verdict, mark the review `BLOCKED`, report the observed error, and stop without silently retrying or treating the failure as a verdict. The CLI preflight checks installation/version; the first read-only call is the actual authentication and service-path check, not a separate endpoint probe.
+
 ---
 
 ## ACT 1 — GRILL (you ↔ Claude)
+
+Start by reporting/logging `GRILL: RUNNING`. Once the interview is resolved, report/log `GRILL: COMPLETE` and `PLAN: DRAFTING` while writing the agreed plan. When it is ready, report/log `PLAN: READY`, then begin the Codex CLI preflight.
 
 > Interview me relentlessly about every aspect of this plan until we reach a shared understanding. Walk down each branch of the design tree, resolving dependencies between decisions one-by-one. For each question, provide your recommended answer.
 >
@@ -52,13 +65,15 @@ Act 1 (grill) complete — plan locked with the user. MAX_ROUNDS=<n>.
 
 ---
 
+Report/log `CODEX_CLI: CHECKING` before running the version check. Require a parseable `codex --version` result ≥ 0.130; if the executable is missing, the command fails, or the version cannot be parsed or is too old, report/log `CODEX_CLI: BLOCKED` and stop before starting Act 2. Report/log `CODEX_CLI: READY (version)` only after it passes.
+
 ## ACT 2 — REVIEW (Claude ↔ Codex)
 
 Now hand the locked plan to Codex for adversarial review. Same engine, mechanics verified end-to-end (2026-06-04).
 
 ### Prerequisites (verify once, fast)
-- `codex --version` ≥ 0.130 (older CLIs error on the default `gpt-5.5` model).
-- Codex authenticated (prior `codex login`; ChatGPT account is fine). On auth/model error, surface it — don't silently retry.
+- `codex --version` must be parseable and ≥ 0.130 (older CLIs error on the default `gpt-5.5` model). A missing executable, failed command, unparseable version, or older version blocks Act 2.
+- Codex authenticated (prior `codex login`; ChatGPT account is fine). There is no separate API health endpoint; the first read-only call checks the configured authentication and service path. On auth, network, or model error, surface it — don't silently retry.
 - Do NOT pin `-m`. Use the config default. Pinning `gpt-5.x-codex` variants 400s on ChatGPT-account auth.
 
 ### Tunables (read from args, else default)
@@ -75,10 +90,13 @@ If invoked with e.g. `rounds=3`, use that for `MAX_ROUNDS`. Echo resolved values
 
 ### Round 1 — fresh session (capture `thread_id`)
 ```bash
+set -o pipefail
 codex exec -s read-only --json -o /tmp/codex-verdict.txt "$(cat REVIEW_PROMPT)" \
-  2>/dev/null | grep '"type":"thread.started"'
+  | grep '"type":"thread.started"'
 ```
 Parse `thread_id` from the `{"type":"thread.started","thread_id":"..."}` line → that's `THREAD_ID`. The critique is in `/tmp/codex-verdict.txt`. Confirm success by the verdict file + a `thread.started` line; if neither appears, the run failed (auth/model) — stop and tell the user. `2>/dev/null` suppresses cosmetic MCP/auth stderr noise.
+
+The command examples leave stderr visible; do not add `2>/dev/null` or other output suppression. Validate the command exit status, non-empty verdict file, and exact final verdict line on every round. A failed or malformed response is `BLOCKED`, not a verdict.
 
 ### Rounds 2..MAX — resume the SAME session (Codex remembers its prior critiques)
 ```bash
@@ -87,14 +105,14 @@ Parse `thread_id` from the `{"type":"thread.started","thread_id":"..."}` line �
 # single most important safety line in the skill — verified 2026-06-04.
 codex exec resume "$THREAD_ID" -c sandbox_mode="read-only" --json \
   -o /tmp/codex-verdict.txt \
-  "I revised the plan. Re-review PLAN.md — check whether your prior findings are addressed and flag anything new. End with VERDICT: APPROVED or VERDICT: REVISE." \
-  2>/dev/null >/dev/null
+  "I revised the plan. Re-review PLAN.md — check whether your prior findings are addressed and flag anything new. End with VERDICT: APPROVED or VERDICT: REVISE."
 ```
 Both `codex exec` and `codex exec resume` support `--json` and `-o/--output-last-message`.
+Keep stderr visible and check the command's exit status, non-empty verdict file, and exact final verdict line on every round. Report/log `CODEX_REVIEW: RUNNING (round n/MAX_ROUNDS)` before each call, then its validated `APPROVED`, `NEEDS_REVISION`, or `BLOCKED` result. A failed or malformed response is `BLOCKED`, not `REVISE`.
 
 ### Each round, after Codex returns
 1. Read `/tmp/codex-verdict.txt`; append to `LOG_FILE`: `## Round <n> — Codex` + the full critique.
-2. Grep the last line for the verdict:
+2. Verify the command succeeded, the verdict file is non-empty, and the last non-empty line is exactly an allowed verdict:
    - `VERDICT: APPROVED` → break to Resolution (converged).
    - `VERDICT: REVISE` → Claude decides **what's actually worth acting on** (Claude is final arbiter — Codex advises, doesn't command). Revise `PLAN_FILE`. Append `### Claude's response` to `LOG_FILE`: what changed, what was rejected, why. Increment round.
 3. If round > `MAX_ROUNDS` → break to Resolution (deadlock).

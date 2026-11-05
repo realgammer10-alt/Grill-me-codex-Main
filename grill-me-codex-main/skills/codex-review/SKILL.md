@@ -11,10 +11,20 @@ This is a **deliberate, high-stakes tool** — reach for it on auth, data models
 
 ## Prerequisites (verify once, fast)
 
-- Codex CLI installed and recent: `codex --version` (need ≥ 0.130; the default `gpt-5.5` model errors on older CLIs).
-- Codex authenticated: a prior `codex login` (ChatGPT account is fine). If a run returns an auth/model error, surface it to the user — do not silently retry.
+- Codex CLI installed and recent: run `codex --version` and confirm the reported version is parseable and ≥ 0.130 (the default `gpt-5.5` model errors on older CLIs). If the command is missing, fails, or reports an unparseable/older version, stop before invoking Codex and report the blocker.
+- Codex authenticated: a prior `codex login` (ChatGPT account is fine). There is no separate health/status endpoint in this workflow; the first read-only review call is the live authentication and service-path check. Surface auth, network, or model errors — do not silently retry.
 - Do NOT pin `-m` unless the user asks. The user's `~/.codex/config.toml` default model is used. Pinning `gpt-5.x-codex` variants fails on ChatGPT-account auth.
 - **Sandbox flag differs between the two commands.** `codex exec` accepts `-s read-only`. `codex exec resume` does NOT — it rejects `-s` ("unexpected argument"). On resume you MUST force read-only via `-c sandbox_mode="read-only"`, because `config.toml` may default `sandbox_mode` to `danger-full-access` (+ `approval_policy="never"`) — which would let Codex WRITE files mid-loop. This is the single most important safety detail in this skill: verified end-to-end on 2026-06-04.
+
+## Progress and status tracking
+
+Show concise status updates in chat when a phase changes, and append the same events to `LOG_FILE` without credentials or other secrets:
+
+- `PLAN: DRAFTING` → `PLAN: READY`
+- `CODEX_CLI: CHECKING` → `CODEX_CLI: READY (version)` or `CODEX_CLI: BLOCKED (reason)`
+- `CODEX_REVIEW: NOT_STARTED` → `CODEX_REVIEW: RUNNING (round n/MAX_ROUNDS)` → `APPROVED`, `NEEDS_REVISION`, or `BLOCKED`
+
+For each round, log its start and its terminal verdict/failure. A round is successful only when the command succeeds, its output contains a `thread.started` event on round 1, the verdict file is present and non-empty, and the last non-empty verdict line is exactly `VERDICT: APPROVED` or `VERDICT: REVISE`. Apply the corresponding verdict only after all checks pass. On a non-zero command result, missing thread/verdict output, or malformed verdict, mark the review `BLOCKED`, report the observed error, and stop; do not treat it as approval or retry silently. Keep the existing read-only flags on every call.
 
 ## Tunable variables (read from skill args, else default)
 
@@ -30,7 +40,7 @@ If the user invoked the skill with an argument like `rounds=3`, use that for `MA
 
 ### Step 0 — Kickoff (human gate #1)
 
-The invocation itself is the kickoff. Confirm scope in one line: what is being planned. If the user gave no task, ask for it (one question). Then proceed — do NOT ask for approval round-by-round; that comes at the end.
+The invocation itself is the kickoff. Confirm scope in one line: what is being planned. If the user gave no task, ask for it (one question). Report `PLAN: DRAFTING`, then proceed — do NOT ask for approval round-by-round; that comes at the end.
 
 ### Step 1 — Claude plans
 
@@ -62,7 +72,7 @@ Initialize `LOG_FILE`:
 Started <stamp the user's local time if known, else "session start">. MAX_ROUNDS=<n>.
 ```
 
-Show the user the plan inline and say you're sending it to Codex for adversarial review.
+Append the initial `PLAN: DRAFTING` and `PLAN: READY` events, then show the user the plan inline and say you're sending it to Codex for adversarial review. Run the CLI version preflight and log/report `CODEX_CLI: READY` or `CODEX_CLI: BLOCKED`; do not start a review when preflight fails.
 
 ### Step 2 — The loop
 
@@ -75,14 +85,15 @@ Maintain `ROUND` (start 1) and `THREAD_ID` (empty until round 1 returns).
 **Round 1** (creates the session — capture `thread_id`):
 
 ```bash
+set -o pipefail
 codex exec -s read-only --json \
   -o /tmp/codex-verdict.txt \
   "$(cat REVIEW_PROMPT)" \
-  2>/dev/null | grep '"type":"thread.started"'
+  | grep '"type":"thread.started"'
 ```
 Parse `thread_id` from the `{"type":"thread.started","thread_id":"..."}` line → that is `THREAD_ID`. The critique text lands in `/tmp/codex-verdict.txt` (Codex's last message). Read that file.
 
-> Note: stderr carries cosmetic MCP/auth noise on some setups — `2>/dev/null` is intentional. Confirm success by the presence of the verdict file + a `thread.started` line. If neither appears, the run failed (auth/model) — stop and tell the user.
+Keep stderr visible so actual failures are diagnosable. Check the command's exit status as well as the `thread.started` event and a non-empty verdict file. Validate that the last non-empty line is exactly one of the two allowed verdicts. Log/report the round status before acting on the verdict; if any check fails, mark the review `BLOCKED` and stop.
 
 **Rounds 2..MAX** (resume the SAME session — Codex remembers its earlier critiques, won't re-litigate settled points):
 
@@ -91,9 +102,9 @@ Parse `thread_id` from the `{"type":"thread.started","thread_id":"..."}` line �
 # inherits config.toml (possibly danger-full-access) and could write files.
 codex exec resume "$THREAD_ID" -c sandbox_mode="read-only" --json \
   -o /tmp/codex-verdict.txt \
-  "I revised the plan. Re-review PLAN.md. Same rules. End with VERDICT: APPROVED or VERDICT: REVISE." \
-  2>/dev/null >/dev/null
+  "I revised the plan. Re-review PLAN.md. Same rules. End with VERDICT: APPROVED or VERDICT: REVISE."
 ```
+Keep errors visible and check the command's exit status, non-empty verdict file, and exact final verdict on every resume. Log/report `RUNNING` before the call and its validated `APPROVED`, `NEEDS_REVISION`, or `BLOCKED` result after it. A failed or malformed response stops the loop; it is not a `REVISE` verdict.
 
 Both `codex exec` and `codex exec resume` support `--json` (stream → parse `thread_id` first round) and `-o/--output-last-message` (verdict capture).
 

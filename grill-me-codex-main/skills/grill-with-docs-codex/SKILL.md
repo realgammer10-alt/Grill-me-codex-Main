@@ -12,9 +12,22 @@ Two acts. Act 1 aligns intent *and* keeps your living docs honest; Act 2 has a d
 
 You enter at two points: answering the grill, and signing off the converged plan.
 
+## Progress and status tracking
+
+Report phase changes in chat and append the same status events to `PLAN-REVIEW-LOG.md`, without credentials or other secrets:
+
+- `GRILL: RUNNING` → `GRILL: COMPLETE`
+- `PLAN: DRAFTING` → `PLAN: READY`
+- `CODEX_CLI: CHECKING` → `CODEX_CLI: READY (version)` or `CODEX_CLI: BLOCKED (reason)`
+- `CODEX_REVIEW: NOT_STARTED` → `CODEX_REVIEW: RUNNING (round n/MAX_ROUNDS)` → `APPROVED`, `NEEDS_REVISION`, or `BLOCKED`
+
+Log each round's start and terminal result. A review round is valid only when the command succeeds, round 1 emits a `thread.started` event, the verdict file is present and non-empty, and its last non-empty line is exactly `VERDICT: APPROVED` or `VERDICT: REVISE`. Keep errors visible. On a failed command, missing output, or malformed verdict, mark the review `BLOCKED`, report the observed error, and stop without silently retrying or treating the failure as a verdict. The CLI preflight checks installation/version; the first read-only call is the actual authentication and service-path check, not a separate endpoint probe.
+
 ---
 
 ## ACT 1 — GRILL WITH DOCS (you ↔ Claude)
+
+Start by reporting/logging `GRILL: RUNNING`. Once the interview and documentation decisions are resolved, report/log `GRILL: COMPLETE` and `PLAN: DRAFTING` while writing the agreed plan. When it is ready, report/log `PLAN: READY`, then begin the Codex CLI preflight.
 
 <what-to-do>
 
@@ -132,13 +145,15 @@ Act 1 (grill-with-docs) complete — plan locked, CONTEXT.md/ADRs updated. MAX_R
 
 ---
 
+Report/log `CODEX_CLI: CHECKING` before running the version check. Require a parseable `codex --version` result ≥ 0.130; if the executable is missing, the command fails, or the version cannot be parsed or is too old, report/log `CODEX_CLI: BLOCKED` and stop before starting Act 2. Report/log `CODEX_CLI: READY (version)` only after it passes.
+
 ## ACT 2 — REVIEW (Claude ↔ Codex)
 
 Hand the locked plan to Codex for adversarial review. Mechanics verified end-to-end (2026-06-04).
 
 ### Prerequisites
-- `codex --version` ≥ 0.130 (older CLIs error on the default `gpt-5.5` model).
-- Codex authenticated (`codex login`; ChatGPT account fine). On auth/model error, surface it — don't silently retry.
+- `codex --version` must be parseable and ≥ 0.130 (older CLIs error on the default `gpt-5.5` model). A missing executable, failed command, unparseable version, or older version blocks Act 2.
+- Codex authenticated (`codex login`; ChatGPT account fine). There is no separate API health endpoint; the first read-only call checks the configured authentication and service path. On auth, network, or model error, surface it — don't silently retry.
 - Do NOT pin `-m` (config default is used; `gpt-5.x-codex` variants 400 on ChatGPT-account auth).
 
 ### Tunables (args, else default)
@@ -155,10 +170,11 @@ Invoked with e.g. `rounds=3` → use it. Echo resolved values first.
 
 ### Round 1 — fresh session (capture `thread_id`)
 ```bash
+set -o pipefail
 codex exec -s read-only --json -o /tmp/codex-verdict.txt "$(cat REVIEW_PROMPT)" \
-  2>/dev/null | grep '"type":"thread.started"'
+  | grep '"type":"thread.started"'
 ```
-Parse `thread_id` from the `thread.started` line. Critique in `/tmp/codex-verdict.txt`. No verdict file + no `thread.started` = failed run (auth/model) → stop, tell the user. `2>/dev/null` hides cosmetic MCP/auth noise.
+Parse `thread_id` from the `thread.started` line. Critique in `/tmp/codex-verdict.txt`. Keep stderr visible and check the command's exit status, the `thread.started` event, the non-empty verdict file, and its exact final verdict line. If any check fails, report/log `CODEX_REVIEW: BLOCKED` with the observed failure and stop; never infer a verdict from a failed run.
 
 ### Rounds 2..MAX — resume SAME session
 ```bash
@@ -167,9 +183,9 @@ Parse `thread_id` from the `thread.started` line. Critique in `/tmp/codex-verdic
 # safety line — verified 2026-06-04.
 codex exec resume "$THREAD_ID" -c sandbox_mode="read-only" --json \
   -o /tmp/codex-verdict.txt \
-  "I revised the plan. Re-review PLAN.md — check prior findings + flag anything new. End with VERDICT: APPROVED or VERDICT: REVISE." \
-  2>/dev/null >/dev/null
+  "I revised the plan. Re-review PLAN.md — check prior findings + flag anything new. End with VERDICT: APPROVED or VERDICT: REVISE."
 ```
+For every round, report/log `CODEX_REVIEW: RUNNING (round n/MAX_ROUNDS)` before the call. Afterward, check exit status, non-empty verdict file, and exact final verdict line; report/log `APPROVED` or `NEEDS_REVISION` only after validation. A failed or malformed response is `BLOCKED`, not `REVISE`.
 
 ### Each round
 1. Read verdict file; append `## Round <n> — Codex` + critique to `LOG_FILE`.

@@ -29,6 +29,12 @@ Built on [Matt Pocock's `grill-me` / `grill-with-docs`](https://github.com/mattp
 
 Two artifacts: `PLAN.md` (the clean final plan — the *what*) and `PLAN-REVIEW-LOG.md` (the full round-by-round argument — the *why*).
 
+## Workflow monitoring
+
+The skills report progress in chat and append status events to `PLAN-REVIEW-LOG.md`: plan/grill progress, Codex CLI preflight, each review round, and the final outcome. Before reviewing, they check that `codex --version` is available and meets the minimum version. The first read-only review call then verifies that the configured Codex authentication and service path actually work; a failed or invalid response is surfaced as blocked rather than silently retried.
+
+This package contains no running service, dashboard, or API endpoint to health-check. Its health signal is the CLI preflight plus the result of the actual read-only review call.
+
 ## Install
 
 Copy the skill folders into your Claude Code skills directory:
